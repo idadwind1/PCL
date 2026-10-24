@@ -1,0 +1,137 @@
+name: Sync upstream and release
+
+on:
+  schedule:
+    - cron: '23 * * * *'
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/upstream-release.yml'
+      - '.github/scripts/upstream_release.py'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upstream-release
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPOSITORY: Meloong-Git/PCL
+  UPSTREAM_BRANCH: main
+  FORK_BRANCH: main
+
+jobs:
+  sync:
+    if: github.repository == 'idadwind1/PCL' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      build: ${{ steps.sync.outputs.build }}
+      sha: ${{ steps.sync.outputs.sha }}
+      version: ${{ steps.sync.outputs.version }}
+      tag: ${{ steps.sync.outputs.tag }}
+      upstream_sha: ${{ steps.sync.outputs.upstream_sha }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Sync source and enable Minecraft downloads
+        id: sync
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python .github/scripts/upstream_release.py sync
+
+  build:
+    needs: sync
+    if: needs.sync.outputs.build == 'true'
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+          submodules: recursive
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - uses: microsoft/setup-msbuild@v3
+        with:
+          msbuild-architecture: x64
+      - name: Prepare build metadata and optional API credentials
+        env:
+          BUILD_SHA: ${{ needs.sync.outputs.sha }}
+          CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          CURSEFORGE_API_KEY: ${{ secrets.CURSEFORGE_API_KEY }}
+        run: python .github/scripts/upstream_release.py prepare
+      - name: Restore dependencies
+        run: |
+          dotnet restore PCLCS/PCLCS.csproj -p:Configuration=Release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Compile Release
+        run: |
+          msbuild "Plain Craft Launcher 2/Plain Craft Launcher 2.vbproj" -m -p:Configuration=Release -p:Platform=AnyCPU
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Package executable and checksum
+        env:
+          RELEASE_VERSION: ${{ needs.sync.outputs.version }}
+          BUILD_SHA: ${{ needs.sync.outputs.sha }}
+          UPSTREAM_SHA: ${{ needs.sync.outputs.upstream_sha }}
+        run: python .github/scripts/upstream_release.py package
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-assets
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    needs: [sync, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: release-assets
+      - name: Tag the built commit and publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_SHA: ${{ needs.sync.outputs.sha }}
+          RELEASE_VERSION: ${{ needs.sync.outputs.version }}
+          RELEASE_TAG: ${{ needs.sync.outputs.tag }}
+          UPSTREAM_SHA: ${{ needs.sync.outputs.upstream_sha }}
+        run: python .github/scripts/upstream_release.py publish
+
+  refresh-archive:
+    needs: [sync, publish]
+    if: always() && !cancelled() && needs.sync.result == 'success' && (needs.publish.result == 'success' || needs.sync.outputs.build == 'false')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: main
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Update root ZIP from published executable
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ needs.sync.outputs.version }}
+          RELEASE_TAG: ${{ needs.sync.outputs.tag }}
+        run: python .github/scripts/upstream_release.py refresh-archive
